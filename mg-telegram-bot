@@ -1,0 +1,241 @@
+import os
+import re
+import zipfile
+import shutil
+import tempfile
+import time
+from datetime import datetime
+import requests
+
+# ==================== CONFIGURATION ====================
+BOT_TOKEN = "8784270471:AAHbpamQpvVJNkEP3gsOL5y8i0x8jaMm8uk"  # Your token
+AUTHORIZED_USERS = [6890268607]  # REPLACE WITH YOUR TELEGRAM ID
+
+def clean_ecid(ecid: str) -> str:
+    if not ecid:
+        return ""
+    if ecid.lower().startswith("0x"):
+        ecid = ecid[2:]
+    ecid = re.sub(r'[^A-Fa-f0-9]', '', ecid).upper()
+    return ecid
+
+def extract_ecid_from_folder(folder_path: str) -> str:
+    folder_name = os.path.basename(folder_path)
+    ecid = clean_ecid(folder_name)
+    if ecid and len(ecid) >= 8:
+        return ecid
+    return ""
+
+def find_file(directory: str, filename: str) -> str:
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if file.lower() == filename.lower():
+                return os.path.join(root, file)
+    return None
+
+def find_directory(directory: str, dirname: str) -> str:
+    for root, dirs, files in os.walk(directory):
+        for dir_name in dirs:
+            if dir_name.lower() == dirname.lower():
+                return os.path.join(root, dir_name)
+    return None
+
+def copy_directory(src: str, dst: str):
+    os.makedirs(dst, exist_ok=True)
+    for item in os.listdir(src):
+        src_path = os.path.join(src, item)
+        dst_path = os.path.join(dst, item)
+        if os.path.isdir(src_path):
+            copy_directory(src_path, dst_path)
+        else:
+            shutil.copy2(src_path, dst_path)
+
+def convert_backup(source_path: str):
+    temp_extract_path = None
+    source_folder = source_path
+    
+    try:
+        if source_path.endswith('.zip'):
+            temp_extract_path = tempfile.mkdtemp(prefix="amg_convert_")
+            with zipfile.ZipFile(source_path, 'r') as zf:
+                zf.extractall(temp_extract_path)
+            source_folder = temp_extract_path
+        
+        ecid = extract_ecid_from_folder(source_folder)
+        if not ecid or len(ecid) < 8:
+            ecid = f"UNKNOWN_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        output_zip_path = os.path.join(tempfile.gettempdir(), f"{ecid}.zip")
+        temp_output_folder = tempfile.mkdtemp(prefix=f"{ecid}_")
+        
+        activation_records_folder = os.path.join(temp_output_folder, "activation_records")
+        os.makedirs(activation_records_folder, exist_ok=True)
+        
+        activation_file = find_file(source_folder, "activation_record.plist")
+        if activation_file:
+            dest_path = os.path.join(activation_records_folder, "activation_record.plist")
+            shutil.copy2(activation_file, dest_path)
+        
+        fairplay_folder = find_directory(source_folder, "FairPlay")
+        if fairplay_folder:
+            dest_fairplay = os.path.join(temp_output_folder, "FairPlay")
+            copy_directory(fairplay_folder, dest_fairplay)
+        
+        commcenter_file = find_file(source_folder, "com.apple.commcenter.device_specific_nobackup.plist")
+        if commcenter_file:
+            dest_path = os.path.join(temp_output_folder, "com.apple.commcenter.device_specific_nobackup.plist")
+            shutil.copy2(commcenter_file, dest_path)
+        
+        purplebuddy_file = find_file(source_folder, "com.apple.purplebuddy.plist")
+        if purplebuddy_file:
+            dest_path = os.path.join(temp_output_folder, "com.apple.purplebuddy.plist")
+            shutil.copy2(purplebuddy_file, dest_path)
+        else:
+            minimal_purplebuddy = '''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>BuddyDone</key>
+    <true/>
+    <key>SetupDone</key>
+    <true/>
+</dict>
+</plist>'''
+            dest_path = os.path.join(temp_output_folder, "com.apple.purplebuddy.plist")
+            with open(dest_path, 'w', encoding='utf-8') as f:
+                f.write(minimal_purplebuddy)
+        
+        if os.path.exists(output_zip_path):
+            os.remove(output_zip_path)
+        
+        with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for root, dirs, files in os.walk(temp_output_folder):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, temp_output_folder)
+                    zf.write(file_path, arcname)
+        
+        if temp_extract_path and os.path.exists(temp_extract_path):
+            shutil.rmtree(temp_extract_path, ignore_errors=True)
+        if os.path.exists(temp_output_folder):
+            shutil.rmtree(temp_output_folder, ignore_errors=True)
+        
+        return output_zip_path, ecid
+        
+    except Exception as e:
+        if temp_extract_path and os.path.exists(temp_extract_path):
+            shutil.rmtree(temp_extract_path, ignore_errors=True)
+        raise e
+
+def telegram_api(method, params=None, files=None):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    try:
+        if files:
+            return requests.post(url, data=params, files=files).json()
+        elif params:
+            return requests.post(url, data=params).json()
+        else:
+            return requests.get(url).json()
+    except Exception as e:
+        print(f"API Error: {e}")
+        return None
+
+def send_message(chat_id, text):
+    return telegram_api("sendMessage", {"chat_id": chat_id, "text": text})
+
+def send_document(chat_id, file_path, caption=None):
+    with open(file_path, 'rb') as f:
+        files = {'document': f}
+        data = {'chat_id': chat_id}
+        if caption:
+            data['caption'] = caption
+        return requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument", data=data, files=files).json()
+
+def get_updates(offset=None):
+    params = {"timeout": 30}
+    if offset:
+        params["offset"] = offset
+    return telegram_api("getUpdates", params)
+
+def is_authorized(user_id):
+    if not AUTHORIZED_USERS:
+        return True
+    return user_id in AUTHORIZED_USERS
+
+def main():
+    LAST_UPDATE_ID = 0
+    print("Bot is running...")
+    
+    while True:
+        try:
+            updates = get_updates(offset=LAST_UPDATE_ID + 1 if LAST_UPDATE_ID else None)
+            
+            if updates and updates.get("ok"):
+                for update in updates.get("result", []):
+                    LAST_UPDATE_ID = update.get("update_id")
+                    message = update.get("message")
+                    if not message:
+                        continue
+                    
+                    user_id = message.get("from", {}).get("id")
+                    chat_id = message.get("chat", {}).get("id")
+                    
+                    if not is_authorized(user_id):
+                        send_message(chat_id, "❌ You are not authorized to use this bot.")
+                        continue
+                    
+                    document = message.get("document")
+                    
+                    if document:
+                        file_name = document.get("file_name", "")
+                        
+                        if not file_name.endswith('.zip'):
+                            send_message(chat_id, "❌ Please send a ZIP file.")
+                            continue
+                        
+                        send_message(chat_id, f"📥 Received: {file_name}\n\n🔄 Converting...")
+                        
+                        file_id = document.get("file_id")
+                        file_info = telegram_api("getFile", {"file_id": file_id})
+                        
+                        if file_info and file_info.get("ok"):
+                            file_path = file_info.get("result", {}).get("file_path")
+                            download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+                            
+                            temp_input_path = os.path.join(tempfile.gettempdir(), f"input_{file_name}")
+                            response = requests.get(download_url)
+                            with open(temp_input_path, 'wb') as f:
+                                f.write(response.content)
+                            
+                            try:
+                                output_path, ecid = convert_backup(temp_input_path)
+                                
+                                if output_path and os.path.exists(output_path):
+                                    send_document(chat_id, output_path, f"✅ CONVERSION COMPLETE!\n\n🔑 ECID: {ecid}")
+                                    os.remove(output_path)
+                                else:
+                                    send_message(chat_id, f"❌ Conversion failed for {file_name}")
+                                
+                                if os.path.exists(temp_input_path):
+                                    os.remove(temp_input_path)
+                                    
+                            except Exception as e:
+                                send_message(chat_id, f"❌ Error: {str(e)}")
+                                if os.path.exists(temp_input_path):
+                                    os.remove(temp_input_path)
+                    
+                    elif message.get("text"):
+                        text = message.get("text", "").lower()
+                        if text == "/start":
+                            send_message(chat_id, "🤖 AMG RAMDISK Backup Converter\n\nSend me a ZIP backup file to convert it.")
+                        elif text == "/id":
+                            send_message(chat_id, f"🆔 Your ID: {user_id}")
+            
+            time.sleep(1)
+            
+        except Exception as e:
+            print(f"Error: {e}")
+            time.sleep(5)
+
+if __name__ == "__main__":
+    main()
